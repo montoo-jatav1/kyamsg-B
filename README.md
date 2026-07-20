@@ -1,56 +1,44 @@
-# KyaMsg Backend — v2 (Spring Boot + PostgreSQL + Redis)
+# SandeshX Backend (Ktor)
 
-This is a from-scratch rewrite, replacing the old H2/file-based backend.
+## Stack
+Kotlin + Ktor · PostgreSQL (via Exposed) · Redis · MinIO · Firebase Cloud Messaging
 
-## Phase 1 (this delivery) — Authentication, real and complete
-
-- Phone number + OTP login (OTP hashed, 5-min expiry, 60-sec resend cooldown, 5 max attempts — all enforced in Redis)
-- JWT access tokens (15 min) + rotating opaque refresh tokens (30 days, SHA-256 hashed at rest)
-- Multi-device sessions (`user_sessions` table) with logout / logout-all-devices
-- PostgreSQL schema via Flyway migrations (no `ddl-auto: update` — real migrations only)
-- Dockerfile + docker-compose (Postgres + Redis + backend) for one-command local run
-- Render-ready: all config comes from environment variables
-
-### Not yet built (coming in the next phases, in priority order)
-1. Profile setup (name/username/photo/recovery email) + Chats/Messages/WebSocket
-2. Groups, Calls, Status
-3. Media upload/compression, notifications (FCM)
-4. Admin dashboard
-5. Myra AI (Gemini-backed) settings screen + chat integration
-
-## One important honesty note about OTP delivery
-
-There's no SMS provider account connected yet (Twilio, MSG91, etc. all cost money and
-need your own account). Right now, `LogOtpSender` **writes the OTP to the server log**
-instead of texting it — this is clearly a development stand-in, not hidden anywhere.
-Everything else about OTP (generation, hashing, expiry, rate-limiting, verification) is
-fully real. When you're ready to send real SMS, implement `OtpSender` against your
-provider's API (one small class) — see the javadoc in `LogOtpSender.java`.
-
-## Running locally
-
-```bash
-cp .env.example .env
-# edit .env and set JWT_SECRET (openssl rand -base64 48)
-docker-compose up --build
+## Local dev
 ```
+cp .env.example .env   # fill in values, especially JWT_SECRET (openssl rand -hex 32)
+docker compose up
+```
+Health check: `GET http://localhost:8080/health`
 
-Backend will be up at `http://localhost:8080`. Health check: `http://localhost:8080/actuator/health`.
-API docs: `http://localhost:8080/swagger-ui.html`.
+## Security — what's actually implemented
+- **OTP**: random 6-digit code, BCrypt-hashed before storing in Redis, 5-minute TTL, max 5 verify
+  attempts, max 5 sends/hour per phone number. **No bypass exists anywhere in this codebase.**
+- **JWT**: short-lived access token (15 min) + refresh token (30 days), HMAC256, secret loaded only
+  from `JWT_SECRET` env var — the app refuses to boot without it.
+- **Passwords/OTP**: BCrypt, never stored or logged in plaintext.
+- **Images**: uploaded directly from the phone to MinIO via a presigned URL — the backend never
+  receives or stores raw image bytes.
+- **Rate limiting**: global 60 req/min per client via Ktor's RateLimit plugin, plus the
+  OTP-specific limits above.
+- **CORS**: locked to `ALLOWED_ORIGIN` in production; wildcard is a dev-only fallback.
 
-## Endpoints in this phase
+## Before going to production
+1. Set a real `JWT_SECRET`, `DATABASE_PASSWORD`, `MINIO_SECRET_KEY` — none of the example values.
+2. Replace `LogSmsSender` (`services/SmsSender.kt`) with a real provider (Twilio, MSG91, etc).
+3. Set `ALLOWED_ORIGIN` to your real domain; remove the `anyHost()` dev fallback in `Application.kt`.
+4. Put this behind HTTPS/TLS (a reverse proxy like Caddy or an ALB) — JWTs over plain HTTP leak.
+5. Set `FIREBASE_CREDENTIALS_PATH` to a service-account JSON from your Firebase project to enable
+   push notifications for offline users.
+6. If you scale to multiple backend instances, back `ConnectionRegistry` with Redis Pub/Sub so a
+   message can reach a recipient connected to a different instance.
 
-| Method | Path                  | Auth required | Description                          |
-|--------|-----------------------|----------------|---------------------------------------|
-| POST   | /api/auth/otp/send    | No             | `{ "phoneNumber": "+919876543210" }`  |
-| POST   | /api/auth/otp/verify  | No             | `{ "phoneNumber", "otp", "deviceId", "deviceName" }` → tokens + user |
-| POST   | /api/auth/refresh     | No             | `{ "refreshToken" }` → new token pair |
-| POST   | /api/auth/logout      | No             | `{ "refreshToken" }` → revokes that session |
-| POST   | /api/auth/logout-all  | Yes (Bearer)   | Revokes every session for the caller  |
-
-## A note on verification
-
-I don't have a JDK compiler, Maven, or internet access in the sandbox I built this in,
-so I could not actually run `mvn compile` here — I reviewed every file carefully by
-hand instead. Please run `docker-compose up --build` on your machine as the real test;
-if anything fails to compile or run, paste the exact error and I'll fix it immediately.
+## API surface
+- `POST /api/auth/otp/send` `{phoneNumber}`
+- `POST /api/auth/otp/verify` `{phoneNumber, code}` → `{accessToken, refreshToken, isNewUser, userId}`
+- `GET  /api/users/me` (JWT)
+- `GET  /api/users/{id}` (JWT)
+- `POST /api/users/me/fcm-token` `{token}` (JWT)
+- `GET  /api/chats/{userId}/messages?before=` (JWT)
+- `POST /api/chats/{userId}/read/{messageId}` (JWT)
+- `POST /api/media/upload-url` (JWT) → presigned MinIO PUT/GET URLs
+- `WS   /ws/chat?token=<accessToken>` — realtime message/read/typing events
